@@ -8,8 +8,8 @@
  */
 #pragma once
 
-#include "Reporting.h"
-#include "Protocol.h"
+#include <wdt/Protocol.h>
+#include <wdt/util/CommonImpl.h>
 
 #include <string>
 
@@ -18,25 +18,38 @@ namespace wdt {
 
 /// struct representing file level data shared between blocks
 struct SourceMetaData {
+  SourceMetaData() {
+  }
+
+  /// Delete copy constructor and assignment operator
+  SourceMetaData(const SourceMetaData &that) = delete;
+  SourceMetaData &operator=(const SourceMetaData &that) = delete;
+
   /// full filepath
   std::string fullPath;
   /// relative pathname
   std::string relPath;
   /**
-   * sequence number associated with the file. Sequence number
+   * Sequence number associated with the file. Sequence number
    * represents the order in which files were first added to the queue.
    * This is a file level identifier. It is same for blocks belonging
    * to the same file. This is efficient while using in sets. Instead
    * of using full path of the file, we can use this to identify the
-   * file.
+   * file. First valid sequence id is 1
    */
-  int64_t seqId;
+  int64_t seqId{0};
   /// size of the entire source
-  int64_t size;
+  int64_t size{0};
   /// file allocation status in the receiver side
-  FileAllocationStatus allocationStatus;
+  FileAllocationStatus allocationStatus{NOT_EXISTS};
   /// if there is a size mismatch, this is the previous sequence id
-  int64_t prevSeqId;
+  int64_t prevSeqId{0};
+  /// If true, files are read using O_DIRECT or F_NOCACHE
+  bool directReads{false};
+  /// File descriptor. If this is not -1, then wdt uses this to read
+  int fd{-1};
+  /// If true, fd was opened by wdt and must be closed after transfer finish
+  bool needToClose{false};
 };
 
 class ByteSource {
@@ -78,8 +91,17 @@ class ByteSource {
    */
   virtual char *read(int64_t &size) = 0;
 
-  /// open the source for reading
-  virtual ErrorCode open() = 0;
+  /// Advances ByteSource offset by numBytes
+  virtual void advanceOffset(int64_t numBytes) = 0;
+
+  /**
+   * open the source for reading
+   *
+   * @param threadCtx    context of the calling thread
+   *
+   * @return      error code
+   */
+  virtual ErrorCode open(ThreadCtx *threadCtx) = 0;
 
   /// close the source for reading
   virtual void close() = 0;
@@ -93,5 +115,6 @@ class ByteSource {
   /// @param stats    Stats to be added
   virtual void addTransferStats(const TransferStats &stats) = 0;
 };
-}
+
+}  // end namespaces
 }

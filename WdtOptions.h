@@ -7,27 +7,57 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 #pragma once
+#include <unistd.h>
 #include <wdt/WdtConfig.h>
-#include <folly/String.h>
+#include <wdt/util/EncryptionUtils.h>
+#include <cstdint>
+#include <set>
+#include <string>
+
 namespace facebook {
 namespace wdt {
+struct ThrottlerOptions;
+
 /**
  * A singleton class managing different options for WDT.
  * There will only be one instance of this class created
  * per creation of sender or receiver or both.
+ * We can now support more than 1 instance of those per process
+ * and attach a different one to sets of Sender/Receivers.
  */
 class WdtOptions {
  public:
+  // WDT option types
+  static const char* FLASH_OPTION_TYPE;
+  static const char* DISK_OPTION_TYPE;
+
   /**
    * A static method that can be called to create
    * the singleton copy of WdtOptions through the lifetime
    * of wdt run.
+   * This is to be avoided, instead use the WdtOptions instance
+   * off each object.
+   * @deprecated
    */
   static const WdtOptions& get();
   /**
-   * Method to get mutable copy of the singleton
+   * Method to get mutable copy of the singleton.
+   * This is to be avoided, instead use the WdtOptions instance
+   * off each object.
+   * @deprecated
    */
   static WdtOptions& getMutable();
+
+  /**
+   * Modifies options based on the type specified
+   *
+   * @param optionType           option type
+   * @param userSpecifiedOptions options specified by user, this options are not
+   *                             changed
+   */
+  void modifyOptions(const std::string& optionType,
+                     const std::set<std::string>& userSpecifiedOptions);
+
   /**
    * Use ipv6 while establishing connection.
    * When both ipv6 and ipv4 are false we will try both
@@ -38,6 +68,12 @@ class WdtOptions {
    * Use ipv4, this takes precedence over ipv6
    */
   bool ipv4{false};
+
+  /**
+   * DSCP flag, see https://en.wikipedia.org/wiki/Differentiated_services.
+   */
+  int dscp{0};
+
   /**
    * Run wdt in a mode where the receiver doesn't
    * write anything to the disk
@@ -67,6 +103,10 @@ class WdtOptions {
    */
   int32_t start_port{22356};  // W (D) T = 0x5754
   int32_t num_ports{8};
+  /**
+   * If true, will use start_port otherwise will use 0 / dynamic ports
+   */
+  bool static_ports{false};
   /**
    * Maximum buffer size for the write on the sender
    * as well as while reading on receiver.
@@ -130,7 +170,8 @@ class WdtOptions {
   std::string prune_dir_regex{""};
 
   /**
-   * Maximum number of retries for transferring a file
+   * Maximum number of times sender thread reconnects without making any
+   * progress
    */
   int max_transfer_retries{3};
 
@@ -185,7 +226,7 @@ class WdtOptions {
   /**
    * timeout for socket connect
    */
-  int32_t connect_timeout_millis{2000};
+  int32_t connect_timeout_millis{1000};
 
   /**
    * interval in ms between abort checks
@@ -198,15 +239,23 @@ class WdtOptions {
   double disk_sync_interval_mb{0.5};
 
   /**
+   * If true, each file is fsync'ed after its last block is
+   * received.
+   * Note that this can cause some performance hit on some filesystems, however
+   * if you disable it there no correctness guarantee will be provided.
+   */
+  bool fsync{true};
+
+  /**
    * Intervals in millis after which progress reporter updates current
    * throughput
    */
   int throughput_update_interval_millis{500};
 
   /**
-   * Flag for turning on/off checksum
+   * Flag for turning on/off checksum. Redundant gcm in ENC_AES128_GCM.
    */
-  bool enable_checksum{true};
+  bool enable_checksum{false};
 
   /**
    * If true, perf stats are collected and reported at the end of transfer
@@ -217,6 +266,11 @@ class WdtOptions {
    * Interval in milliseconds after which transfer log is written to disk
    */
   int transfer_log_write_interval_ms{100};
+
+  /**
+   * If true, compact transfer log if transfer finishes successfully
+   */
+  bool enable_transfer_log_compaction{false};
 
   /**
    * If true, download resumption is enabled
@@ -231,7 +285,7 @@ class WdtOptions {
   /**
    * If true, WDT does not verify sender ip during resumption
    */
-  bool disable_sender_verfication_during_resumption{false};
+  bool disable_sender_verification_during_resumption{false};
 
   /**
    * Max number of senders allowed globally
@@ -254,20 +308,138 @@ class WdtOptions {
   int namespace_receiver_limit{1};
 
   /**
-   * Since this is a singleton copy constructor
-   * and assignment operator are deleted
+   * Read files in O_DIRECT
+   */
+  bool odirect_reads{false};
+
+  /**
+   * If true, files are not pre-allocated using posix_fallocate.
+   * This flag should not be used directly by wdt code. It should be accessed
+   * through shouldPreallocateFiles method.
+   */
+  bool disable_preallocation{false};
+
+  /**
+   * If true, destination directory tree is trusted during resumption. So, only
+   * the remaining portion of the files are transferred. This is only supported
+   * if preallocation and block mode is disabled.
+   */
+  bool resume_using_dir_tree{false};
+
+  /**
+   * If > 0 will open up to that number of files during discovery
+   * if 0 will not open any file during discovery
+   * if < 0 will try to open all the files during discovery (which may fail
+   * with too many open files errors)
+   */
+  int open_files_during_discovery{0};
+
+  /**
+   * If true, wdt can overwrite existing files
+   */
+  bool overwrite{false};
+
+  /**
+   * Extra time buffer to account for network when sender waits for receiver to
+   * finish processing buffered data
+   */
+  int drain_extra_ms{500};
+
+  /**
+   * Encryption type to use
+   */
+  std::string encryption_type{encryptionTypeToStr(ENC_AES128_GCM)};
+
+  /**
+   * Encryption tag verification interval in bytes. A value of zero disables
+   * incremental tag verification. In that case, tag only gets verified at the
+   * end.
+   */
+  int encryption_tag_interval_bytes{4 * 1024 * 1024};
+
+  /**
+   * send buffer size for Sender. If < = 0, buffer size is not set
+   */
+  int send_buffer_size{0};
+
+  /**
+   * receive buffer size for Receiver. If < = 0, buffer size is not set
+   */
+  int receive_buffer_size{0};
+
+  /**
+   * If true, extra files on the receiver side is deleted during resumption
+   */
+  bool delete_extra_files{false};
+
+  /**
+   * If true, fadvise is skipped after block write
+   */
+  bool skip_fadvise{false};
+
+  /**
+   * If true, periodic heart-beats from receiver to sender is enabled.
+   * The heart-beat interval is determined by the socket read timeout of the
+   * sender.
+   * WDT senders streams data and only waits for a receiver response after
+   * all the blocks are sent. Because of the high socket buffer sizes, it might
+   * take a long time for receiver to process all the bytes sent. So, for slower
+   * threads, there is significant difference between the time receiver
+   * processes all the bytes and the time sender finishes sending all the bytes.
+   * So, the sender might time out while waiting for the response from receiver.
+   * This happens a lot more for disks because of the lower io throughput.
+   * To solve this, receiver sends heart-beats to signal that it is sill
+   * processing data, and sender waits will it is still getting heart-beats.
+   */
+  bool enable_heart_beat{true};
+
+  /**
+   * Number of MBytes after which encryption iv is changed. A value of 0
+   * disables iv change.
+   */
+  int iv_change_interval_mb{32 * 1024};
+
+  /**
+   * @return    whether files should be pre-allocated or not
+   */
+  bool shouldPreallocateFiles() const;
+
+  /**
+   * @return    whether transfer log based resumption is enabled
+   */
+  bool isLogBasedResumption() const;
+
+  /**
+   * @return    whether directory tree based resumption is enabled
+   */
+  bool isDirectoryTreeBasedResumption() const;
+
+  /**
+   * @return    throttler options
+   */
+  ThrottlerOptions getThrottlerOptions() const;
+
+  // NOTE: any option added here should also be added to util/WdtFlags.cpp.inc
+
+  /**
+   * Initialize the fields of this object from another src one. ie makes 1 copy
+   * explicitly.
+   */
+  void copyInto(const WdtOptions& src);
+  /**
+   * This used to be a singleton (which as always is a pretty bad idea)
+   * so copy constructor and assignment operator were deleted
+   * We still want to avoid accidental copying around of a fairly
+   * big object thus the copyInto pattern above
    */
   WdtOptions(const WdtOptions&) = delete;
-  WdtOptions& operator=(const WdtOptions&) = delete;
   WdtOptions() {
   }
-
-  virtual ~WdtOptions() {
+  ~WdtOptions() {
   }
 
- protected:
-  /// singleton options instance
-  static WdtOptions* instance_;
+ private:
+  WdtOptions& operator=(const WdtOptions&) = default;
 };
 }
 }

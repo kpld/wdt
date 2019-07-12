@@ -8,163 +8,31 @@
  */
 #pragma once
 
-#include "ErrorCodes.h"
-#include "WdtOptions.h"
-#include "Reporting.h"
-#include "Throttler.h"
-#include "Protocol.h"
+#include <folly/synchronization/RWSpinLock.h>
+#include <wdt/AbortChecker.h>
+#include <wdt/ErrorCodes.h>
+#include <wdt/Protocol.h>
+#include <wdt/Reporting.h>
+#include <wdt/Throttler.h>
+#include <wdt/WdtOptions.h>
+#include <wdt/WdtThread.h>
+#include <wdt/util/DirectorySourceQueue.h>
+#include <wdt/util/EncryptionUtils.h>
+#include <wdt/util/ThreadsController.h>
 #include <memory>
 #include <string>
-#include <vector>
-#include <folly/RWSpinLock.h>
 #include <unordered_map>
+#include <vector>
+
 namespace facebook {
 namespace wdt {
 
-/// filename-filesize pair. Negative filesize denotes the entire file.
-typedef std::pair<std::string, int64_t> FileInfo;
-
-/**
- * Basic Uri class to parse and get information from wdt url
- * This class can be used in two ways :
- * 1. Construct the class with a url and get fields like
- *    hostname, and different get parameters
- * 2. Construct an empty object and set the fields, and
- *    generate a url
- *
- * Example of a url :
- * wdt://localhost?dir=/tmp/wdt&ports=22356,22357
- */
-class WdtUri {
- public:
-  /// Empty Uri object
-  WdtUri() = default;
-
-  /// Construct the uri object using a string url
-  explicit WdtUri(const std::string& url);
-
-  /// Get the host name of the url
-  std::string getHostName() const;
-
-  /// Get the query param by key
-  std::string getQueryParam(const std::string& key) const;
-
-  /// Get all the query params
-  const std::unordered_map<std::string, std::string>& getQueryParams() const;
-
-  /// Sets hostname to generate a url
-  void setHostName(const std::string& hostName);
-
-  /// Sets a query param in the query params map
-  void setQueryParam(const std::string& key, const std::string& value);
-
-  /// Generate url by serializing the members of this struct
-  std::string generateUrl() const;
-
-  /// Assignment operator to convert string to wdt uri object
-  WdtUri& operator=(const std::string& url);
-
-  /// Clears the field of the uri
-  void clear();
-
-  /// Get the error code if any during parsing
-  ErrorCode getErrorCode() const;
-
- private:
-  /**
-   * Returns whether the url could be processed successfully. Populates
-   * the values on a best effort basis.
-   */
-  ErrorCode process(const std::string& url);
-
-  /**
-   * Map of get parameters of the url. Key and value
-   * of the map are the name and value of get parameter respectively
-   */
-  std::unordered_map<std::string, std::string> queryParams_;
-
-  /// Prefix of the wdt url
-  const std::string WDT_URL_PREFIX{"wdt://"};
-
-  /// Hostname where the receiever is running
-  std::string hostName_{""};
-
-  /// Error code that reflects that status of parsing url
-  ErrorCode errorCode_{OK};
-};
-
-/**
- * Basic request for creating wdt objects
- * This request can be used for creating receivers and the
- * counter part sender or vice versa
- */
-struct WdtTransferRequest {
-  /**
-   * Transfer Id for the transfer. It has to be same
-   * on both sender and receiver
-   */
-  std::string transferId;
-
-  /// Protocol version on sender and receiver
-  int64_t protocolVersion{Protocol::protocol_version};
-
-  /// Ports on which receiver is listening / sender is sending to
-  std::vector<int32_t> ports;
-
-  /// Address on which receiver binded the ports / sender is sending data to
-  std::string hostName;
-
-  /// Directory to write the data to / read the data from
-  std::string directory;
-
-  /// Only required for the sender
-  std::vector<FileInfo> fileInfo;
-
-  /// Any error assosciated with this transfer request upon processing
-  ErrorCode errorCode{OK};
-
-  /// Constructor with list of ports
-  explicit WdtTransferRequest(const std::vector<int32_t>& ports);
-
-  /**
-   * Constructor with start port and num ports. Fills the vector with
-   * ports from [startPort, startPort + numPorts)
-   */
-  WdtTransferRequest(int startPort, int numPorts, const std::string& directory);
-
-  /// Constructor to construct the request object from a url string
-  explicit WdtTransferRequest(const std::string& uriString);
-
-  /// Serialize this structure into a url string containing all fields
-  std::string generateUrl(bool genFull = false) const;
-
-  /// Get stringified port list
-  std::string getSerializedPortsList() const;
-
-  /// Operator for finding if two request objects are equal
-  bool operator==(const WdtTransferRequest& that) const;
-
-  /// Names of the get parameters for different fields
-  const static std::string TRANSFER_ID_PARAM;
-  const static std::string PROTOCOL_VERSION_PARAM;
-  const static std::string DIRECTORY_PARAM;
-  const static std::string PORTS_PARAM;
-};
-
 /**
  * Shared code/functionality between Receiver and Sender
- * TODO: a lot more code from sender/receiver should move here
+ * TODO: check if more of Receiver/Sender should move here
  */
 class WdtBase {
  public:
-  /// Interface for external abort checks (pull mode)
-  class IAbortChecker {
-   public:
-    virtual bool shouldAbort() const = 0;
-    virtual ~IAbortChecker() {
-    }
-  };
-
   /// Constructor
   WdtBase();
 
@@ -173,7 +41,10 @@ class WdtBase {
    * that corresponds to the information relating to the sender
    * The transfer request has error code set should there be an error
    */
-  virtual WdtTransferRequest init() = 0;
+  virtual const WdtTransferRequest& init() = 0;
+
+  /// Sets other options than global/singleton ones - call this before init()
+  void setWdtOptions(const WdtOptions& src);
 
   /// Destructor
   virtual ~WdtBase();
@@ -182,10 +53,18 @@ class WdtBase {
   /// get aborted after this method has been called based on
   /// whether they are doing read/write on the socket and the timeout for the
   /// socket. Push mode for abort.
-  void abort(const ErrorCode abortCode);
+  void abort(ErrorCode abortCode);
 
   /// clears abort flag
   void clearAbort();
+
+  /**
+   * Returns a reference to the copy of WdtOptions held by this object.
+   * Changes should only be made before init() is called, not after.
+   */
+  WdtOptions& getWdtOptions() {
+    return options_;
+  }
 
   /**
    * sets an extra external call back to check for abort
@@ -197,7 +76,7 @@ class WdtBase {
 
   /// threads can call this method to find out
   /// whether transfer has been marked from abort
-  ErrorCode getCurAbortCode();
+  ErrorCode getCurAbortCode() const;
 
   /// Wdt objects can report progress. Setter for progress reporter
   /// defined in Reporting.h
@@ -209,11 +88,17 @@ class WdtBase {
   /// Sets the transferId for this transfer
   void setTransferId(const std::string& transferId);
 
-  /// Sets the protocol version for the transfer
-  void setProtocolVersion(int64_t protocolVersion);
+  ///  Get the protocol version of the transfer
+  int getProtocolVersion() const;
+
+  /// Sets protocol version to use
+  void setProtocolVersion(int protocolVersion);
 
   /// Get the transfer id of the object
   std::string getTransferId();
+
+  /// Get the transfer request
+  WdtTransferRequest& getTransferRequest();
 
   /// Finishes the wdt object and returns a report
   virtual std::unique_ptr<TransferReport> finish() = 0;
@@ -225,22 +110,21 @@ class WdtBase {
   /// Basic setup for throttler using options
   void configureThrottler();
 
-  /// Utility to generate a random transer id
+  /// Utility to generate a random transfer id
   static std::string generateTransferId();
 
- protected:
-  /// Global throttler across all threads
-  std::shared_ptr<Throttler> throttler_;
+  /// Get the throttler
+  std::shared_ptr<Throttler> getThrottler() const;
 
-  /// Holds the instance of the progress reporter default or customized
-  std::unique_ptr<ProgressReporter> progressReporter_;
+  /// @return   Root directory
+  const std::string& getDirectory() const;
 
-  /// Unique id for the transfer
-  std::string transferId_;
+  /// @param      whether the object is stale. If all the transferring threads
+  ///             have finished, the object will marked as stale
+  bool isStale();
 
-  /// protocol version to use, this is determined by negotiating protocol
-  /// version with the other side
-  int protocolVersion_{Protocol::protocol_version};
+  /// @return       Whether the transfer has started
+  bool hasStarted();
 
   /// abort checker class passed to socket functions
   class AbortChecker : public IAbortChecker {
@@ -248,7 +132,7 @@ class WdtBase {
     explicit AbortChecker(WdtBase* wdtBase) : wdtBase_(wdtBase) {
     }
 
-    bool shouldAbort() const {
+    bool shouldAbort() const override {
       return wdtBase_->getCurAbortCode() != OK;
     }
 
@@ -256,11 +140,69 @@ class WdtBase {
     WdtBase* wdtBase_;
   };
 
+ protected:
+  enum TransferStatus {
+    NOT_STARTED,     // threads not started
+    ONGOING,         // transfer is ongoing
+    FINISHED,        // last running thread finished
+    THREADS_JOINED,  // threads joined
+  };
+
+  /// Validate the transfer request
+  virtual ErrorCode validateTransferRequest();
+
+  /// @return current transfer status
+  TransferStatus getTransferStatus();
+
+  /// corrects buffer size if necessary
+  void checkAndUpdateBufferSize();
+
+  /// @param transferStatus   current transfer status
+  void setTransferStatus(TransferStatus transferStatus);
+
+  /// Sets the protocol version for the transfer
+  void negotiateProtocol();
+
+  /// Dumps performance statistics if enable_perf_stat_collection is true.
+  virtual void logPerfStats() const = 0;
+
+  /// Input/output transfer request
+  WdtTransferRequest transferRequest_;
+
+  /// Global throttler across all threads
+  std::shared_ptr<Throttler> throttler_;
+
+  /// Holds the instance of the progress reporter default or customized
+  std::unique_ptr<ProgressReporter> progressReporter_;
+
   /// abort checker passed to socket functions
   AbortChecker abortCheckerCallback_;
 
+  /// current transfer status
+  TransferStatus transferStatus_{NOT_STARTED};
+
+  /// Mutex which is shared between the parent thread, transferring threads and
+  /// progress reporter thread
+  std::mutex mutex_;
+
+  /// Mutex for the management of this instance, specifically to keep the
+  /// instance sane for multi threaded public API calls
+  std::mutex instanceManagementMutex_;
+
+  /// This condition is notified when the transfer is finished
+  std::condition_variable conditionFinished_;
+
+  /// Controller for wdt threads shared between base and threads
+  ThreadsController* threadsController_{nullptr};
+
+  /// Dump perf stats if notified
+  ReportPerfSignalSubscriber reportPerfSignal_;
+
+  /// Options/config used by this object
+  WdtOptions options_;
+
  private:
-  folly::RWSpinLock abortCodeLock_;
+  mutable folly::RWSpinLock abortCodeLock_;
   /// Internal and default abort code
   ErrorCode abortCode_{OK};
   /// Additional external source of check for abort requested

@@ -8,20 +8,21 @@
  */
 #pragma once
 
-#include "ErrorCodes.h"
-#include "WdtOptions.h"
+#include <wdt/AbortChecker.h>
+#include <wdt/ErrorCodes.h>
+#include <wdt/WdtOptions.h>
+#include <wdt/WdtTransferRequest.h>
+#include <wdt/util/EncryptionUtils.h>
 
-#include <vector>
-#include <string>
+#include <algorithm>
 #include <chrono>
-#include <limits>
 #include <iterator>
+#include <limits>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
-#include <folly/RWSpinLock.h>
-#include <folly/SpinLock.h>
-#include <folly/Memory.h>
-#include <folly/ThreadLocal.h>
+#include <folly/synchronization/RWSpinLock.h>
 
 namespace facebook {
 namespace wdt {
@@ -29,6 +30,7 @@ namespace wdt {
 const double kMbToB = 1024 * 1024;
 const double kMicroToMilli = 1000;
 const double kMicroToSec = 1000 * 1000;
+const double kMilliToSec = 1000;
 
 typedef std::chrono::high_resolution_clock Clock;
 
@@ -53,6 +55,7 @@ std::ostream &operator<<(std::ostream &os, const std::vector<T> &v) {
   return os;
 }
 
+// TODO rename to ThreadResult
 /// class representing statistics related to file transfer
 class TransferStats {
  private:
@@ -75,14 +78,26 @@ class TransferStats {
   /// number of failed transfers
   int64_t failedAttempts_ = 0;
 
+  /// Total number of blocks sent by sender
+  int64_t numBlocksSend_{-1};
+
+  /// Total number of bytes sent by sender
+  int64_t totalSenderBytes_{-1};
+
   /// status of the transfer
-  ErrorCode errCode_ = OK;
+  ErrorCode localErrCode_ = OK;
 
   /// status of the remote
   ErrorCode remoteErrCode_ = OK;
 
   /// id of the owner object
   std::string id_;
+
+  /// encryption type used
+  EncryptionType encryptionType_{ENC_NONE};
+
+  /// is tls enabled?
+  bool tls_{false};
 
   /// mutex to support synchronized access
   std::unique_ptr<folly::RWSpinLock> mutex_{nullptr};
@@ -96,7 +111,7 @@ class TransferStats {
 
   explicit TransferStats(bool isLocked = false) {
     if (isLocked) {
-      mutex_ = folly::make_unique<folly::RWSpinLock>();
+      mutex_ = std::make_unique<folly::RWSpinLock>();
     }
   }
 
@@ -111,7 +126,19 @@ class TransferStats {
     effectiveHeaderBytes_ = effectiveDataBytes_ = 0;
     numFiles_ = numBlocks_ = 0;
     failedAttempts_ = 0;
-    errCode_ = remoteErrCode_ = OK;
+    localErrCode_ = remoteErrCode_ = OK;
+  }
+
+  /// @return the number of blocks sent by sender
+  int64_t getNumBlocksSend() const {
+    folly::RWSpinLock::ReadHolder lock(mutex_.get());
+    return numBlocksSend_;
+  }
+
+  /// @return the total sender bytes
+  int64_t getTotalSenderBytes() const {
+    folly::RWSpinLock::ReadHolder lock(mutex_.get());
+    return totalSenderBytes_;
   }
 
   /// @return number of header bytes transferred
@@ -188,18 +215,15 @@ class TransferStats {
   }
 
   /// @return error code based on combinator of local and remote error
-  ErrorCode getCombinedErrorCode() const {
-    folly::RWSpinLock::ReadHolder lock(mutex_.get());
-    if (errCode_ != OK || remoteErrCode_ != OK) {
-      return ERROR;
-    }
-    return OK;
-  }
-
-  /// @return status of the transfer
   ErrorCode getErrorCode() const {
     folly::RWSpinLock::ReadHolder lock(mutex_.get());
-    return errCode_;
+    return getMoreInterestingError(localErrCode_, remoteErrCode_);
+  }
+
+  /// @return status of the transfer on this side
+  ErrorCode getLocalErrorCode() const {
+    folly::RWSpinLock::ReadHolder lock(mutex_.get());
+    return localErrCode_;
   }
 
   /// @return status of the transfer on the remote end
@@ -225,6 +249,18 @@ class TransferStats {
     headerBytes_ += count;
   }
 
+  /// @param set num blocks send
+  void setNumBlocksSend(int64_t numBlocksSend) {
+    folly::RWSpinLock::WriteHolder lock(mutex_.get());
+    numBlocksSend_ = numBlocksSend;
+  }
+
+  /// @param set total sender bytes
+  void setTotalSenderBytes(int64_t totalSenderBytes) {
+    folly::RWSpinLock::WriteHolder lock(mutex_.get());
+    totalSenderBytes_ = totalSenderBytes;
+  }
+
   /// one more file transfer failed
   void incrFailedAttempts() {
     folly::RWSpinLock::WriteHolder lock(mutex_.get());
@@ -232,9 +268,9 @@ class TransferStats {
   }
 
   /// @param status of the transfer
-  void setErrorCode(ErrorCode errCode) {
+  void setLocalErrorCode(ErrorCode errCode) {
     folly::RWSpinLock::WriteHolder lock(mutex_.get());
-    errCode_ = errCode;
+    localErrCode_ = errCode;
   }
 
   /// @param status of the transfer on the remote end
@@ -284,35 +320,62 @@ class TransferStats {
     effectiveDataBytes_ -= dataBytes;
   }
 
+  void setEncryptionType(EncryptionType encryptionType) {
+    folly::RWSpinLock::WriteHolder lock(mutex_.get());
+    encryptionType_ = encryptionType;
+  }
+
+  EncryptionType getEncryptionType() const {
+    folly::RWSpinLock::ReadHolder lock(mutex_.get());
+    return encryptionType_;
+  }
+
+  void setTls(bool tls) {
+    folly::RWSpinLock::WriteHolder lock(mutex_.get());
+    tls_ = tls;
+  }
+
+  bool getTls() const {
+    folly::RWSpinLock::ReadHolder lock(mutex_.get());
+    return tls_;
+  }
+
   TransferStats &operator+=(const TransferStats &stats);
 
   friend std::ostream &operator<<(std::ostream &os, const TransferStats &stats);
 };
 
 /**
- * class representing entire client transfer report
+ * Class representing entire client transfer report.
+ * Unit are mebibyte (MiB), ie 1048576 bytes which we call "Mbytes"
+ * for familiarity
  */
 class TransferReport {
  public:
+  // TODO: too many constructor parameters, needs to clean-up
   /**
    * This constructor moves all the stat objects to member variables. This is
-   * only called at the end of transfer.
+   * only called at the end of transfer by the sender
    */
   TransferReport(std::vector<TransferStats> &transferredSourceStats,
                  std::vector<TransferStats> &failedSourceStats,
                  std::vector<TransferStats> &threadStats,
                  std::vector<std::string> &failedDirectories, double totalTime,
-                 int64_t totalFileSize, int64_t numDiscoveredFiles);
+                 int64_t totalFileSize, int64_t numDiscoveredFiles,
+                 int64_t previouslySentBytes, bool fileDiscoveryFinished);
 
   /**
    * This function does not move the thread stats passed to it. This is called
    * by the progress reporter thread.
    */
   TransferReport(const std::vector<TransferStats> &threadStats,
-                 double totalTime, int64_t totalFileSize);
+                 double totalTime, int64_t totalFileSize,
+                 int64_t numDiscoveredFiles, bool fileDiscoveryFinished);
 
-  /// constructor used by receiver, does move the thread stats
-  explicit TransferReport(std::vector<TransferStats> &threadStats);
+  TransferReport(TransferStats &&stats, double totalTime, int64_t totalFileSize,
+                 int64_t numDiscoveredFiles, bool fileDiscoveryFinished);
+  /// constructor used by receiver, does move the stats
+  explicit TransferReport(TransferStats &&globalStats);
   /// @return   summary of the report
   const TransferStats &getSummary() const {
     return summary_;
@@ -343,7 +406,7 @@ class TransferReport {
   int64_t getTotalFileSize() const {
     return totalFileSize_;
   }
-  /// @return   recent throughput in mbps
+  /// @return   recent throughput in Mbytes/sec
   double getCurrentThroughputMBps() const {
     return currentThroughput_ / kMbToB;
   }
@@ -355,14 +418,24 @@ class TransferReport {
   void setCurrentThroughput(double currentThroughput) {
     currentThroughput_ = currentThroughput;
   }
-  void setErrorCode(ErrorCode errCode) {
-    summary_.setErrorCode(errCode);
-  }
   void setTotalTime(double totalTime) {
     totalTime_ = totalTime;
   }
   void setTotalFileSize(int64_t totalFileSize) {
     totalFileSize_ = totalFileSize;
+  }
+  void setErrorCode(const ErrorCode errCode) {
+    summary_.setLocalErrorCode(errCode);
+    summary_.setRemoteErrorCode(errCode);
+  }
+  int64_t getNumDiscoveredFiles() const {
+    return numDiscoveredFiles_;
+  }
+  bool fileDiscoveryFinished() const {
+    return fileDiscoveryFinished_;
+  }
+  int64_t getPreviouslySentBytes() const {
+    return previouslySentBytes_;
   }
   friend std::ostream &operator<<(std::ostream &os,
                                   const TransferReport &report);
@@ -383,6 +456,12 @@ class TransferReport {
   int64_t totalFileSize_{0};
   /// recent throughput in bytes/sec
   double currentThroughput_{0};
+  /// Count of all files discovered so far
+  int64_t numDiscoveredFiles_{0};
+  /// Number of bytes sent in previous transfers
+  int64_t previouslySentBytes_{0};
+  /// Is file discovery finished?
+  bool fileDiscoveryFinished_{false};
 };
 
 /**
@@ -391,7 +470,8 @@ class TransferReport {
  */
 class ProgressReporter {
  public:
-  ProgressReporter() {
+  explicit ProgressReporter(const WdtTransferRequest &transferRequest)
+      : transferRequest_(transferRequest) {
     isTty_ = isatty(STDOUT_FILENO);
   }
 
@@ -402,7 +482,7 @@ class ProgressReporter {
   /**
    * This method gets called repeatedly with interval defined by
    * progress_report_interval. If stdout is a terminal, then it displays
-   * transfer progress in stdout. Example output [===>    ] 30% 5.00 MBytes/sec.
+   * transfer progress in stdout. Example output [===>    ] 30% 5.00 Mbytes/sec.
    * Else, it prints progress details in stdout.
    *
    * @param report                current transfer report
@@ -419,6 +499,11 @@ class ProgressReporter {
   virtual ~ProgressReporter() {
   }
 
+ protected:
+  /// Reference to the wdt transfer request for the wdt base
+  /// object using the progress reporter
+  const WdtTransferRequest &transferRequest_;
+
  private:
   /**
    * Displays progress of the transfer in stdout
@@ -426,9 +511,12 @@ class ProgressReporter {
    * @param progress              progress percentage
    * @param throughput            average throughput
    * @param currentThroughput     recent throughput
+   * @param numDiscoveredFiles    number of files discovered so far
+   * @param fileDiscoveryFinished true once file discovery has compeleted
    */
   void displayProgress(int progress, double averageThroughput,
-                       double currentThroughput);
+                       double currentThroughput, int64_t numDiscoveredFiles,
+                       bool fileDiscoveryFinished);
 
   /**
    * logs progress details
@@ -437,27 +525,16 @@ class ProgressReporter {
    * @param progress              progress percentage
    * @param throughput            average throughput
    * @param currentThroughput     recent throughput
+   * @param numDiscoveredFiles    number of files discovered so far
+   * @param fileDiscoveryFinished true once file discovery has compeleted
    */
   void logProgress(int64_t effectiveDataBytes, int progress,
-                   double averageThroughput, double currentThroughput);
+                   double averageThroughput, double currentThroughput,
+                   int64_t numDiscoveredFiles, bool fileDiscoveryFinished);
 
   /// whether stdout is redirected to a terminal or not
   bool isTty_;
 };
-
-#define INIT_PERF_STAT_REPORT perfStatReport.reset(new PerfStatReport);
-
-#define START_PERF_TIMER                               \
-  Clock::time_point startTimePERF;                     \
-  if (WdtOptions::get().enable_perf_stat_collection) { \
-    startTimePERF = Clock::now();                      \
-  }
-
-#define RECORD_PERF_RESULT(statType)                                 \
-  if (WdtOptions::get().enable_perf_stat_collection) {               \
-    int64_t duration = durationMicros(Clock::now() - startTimePERF); \
-    perfStatReport->addPerfStat(statType, duration);                 \
-  }
 
 /// class representing perf stat collection
 class PerfStatReport {
@@ -470,20 +547,24 @@ class PerfStatReport {
     FILE_READ,
     FILE_WRITE,
     SYNC_FILE_RANGE,
-    FSYNC,
+    FSYNC_STATS,  // just 'FSYNC' is defined on Windows/conflicts
     FILE_SEEK,
     THROTTLER_SLEEP,
     RECEIVER_WAIT_SLEEP,  // receiver sleep duration between sending wait cmd to
-                          // sender. A high sum for this suggestes threads
+                          // sender. A high sum for this suggests threads
                           // were not properly load balanced
+    DIRECTORY_CREATE,
+    IOCTL,
+    UNLINK,
+    FADVISE,
     END
   };
 
-  explicit PerfStatReport();
+  explicit PerfStatReport(const WdtOptions &options);
 
   /**
    * @param statType      stat-type
-   * @param timeInMicros  time taken by the operatin in microseconds
+   * @param timeInMicros  time taken by the operation in microseconds
    */
   void addPerfStat(StatType statType, int64_t timeInMicros);
 
@@ -507,8 +588,8 @@ class PerfStatReport {
   int64_t sumMicros_[kNumTypes_] = {0};
   /// network timeout in milliseconds
   int networkTimeoutMillis_;
+  /// mutex to support synchronized access
+  mutable folly::RWSpinLock mutex_;
 };
-
-extern folly::ThreadLocalPtr<PerfStatReport> perfStatReport;
 }
 }

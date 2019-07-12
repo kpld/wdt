@@ -1,6 +1,10 @@
-![](wdt_logo.png)
+![](build/wdt_logo.png)
 `WDT` Warp speed Data Transfer
 ------------------------------
+
+[![Join the chat at https://gitter.im/facebook/wdt](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/facebook/wdt?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+
+[![Build Status](https://travis-ci.org/facebook/wdt.svg?branch=master)](https://travis-ci.org/facebook/wdt)
 
 ## Design philosophy/Overview
 
@@ -24,6 +28,14 @@ at any given point some threads are reading while others are writing, and data
 is buffered on both paths - keeping each subsystem busy while minimizing
 kernel to userspace switches.
 
+## Terminology
+WDT uses "Mbytes" everywhere in its output as 1024*1024 bytes = 1048576 bytes
+(technically this should be the new mebibyte (MiB) standard but it felt
+Mbytes is be more in line with what other tools are using, clearer, easier
+to read and matching what a traditional "megabyte" used to mean in historical
+memory units where the address lines are binary and thus power of two and not
+of ten)
+
 ## Example
 
 While WDT is primarily a library, we also have a small command line tool
@@ -41,7 +53,7 @@ Sender side: (discover and sends all files in a directory tree to destination)
 [=================================================] 100% 588.8 Mbytes/s
 I0720 21:48:08.446014 3245296 Sender.cpp:314] Total sender time = 2.68699
 seconds (0.00640992 dirTime). Transfer summary : Transfer status = OK. Number
-of files transferred = 1887. Data Mbytes = 1582.08. Header kBytes = 62.083
+of files transferred = 1887. Data Mbytes = 1582.08. Header Kbytes = 62.083
 (0.00383215% overhead). Total bytes = 1658999858. Wasted bytes due to
 failure = 0 (0% overhead). Total sender throughput = 588.816 Mbytes/sec
 (590.224 Mbytes/sec pure transf rate)
@@ -52,8 +64,6 @@ a linux distribution), but not much data (~1.5Gbyte), the maximum
 speed isn't as good as it would with more data (as there is still a TCP ramp
 up time even though it's faster because of parallelization) like when we use
 it in our production use cases.
-
-See "wcp.sh" (which installs as "wcp") for a more detailed example.
 
 ## Performance/Results
 
@@ -70,17 +80,20 @@ but we do plan on optimizing for disks as well in the future.
 
 ## Dependencies
 
-CMake for building WDT - See [BUILD.md](BUILD.md)
+CMake for building WDT - See [build/BUILD.md](build/BUILD.md)
 
 gflags (google flags library) but only for the command line,  the library
 doesn't depend on that
 
-gmock and gtest (google testing) but only for tests
+gtest (google testing) but only for tests
 
-glog (google logging library)
+glog (google logging library) - use W*LOG macros so everything logged by WDT
+is always prefixed by "wdt>" which helps when embedded in another service
 
 Parts of Facebook's Folly open source library (as set in the CMakefile)
 Mostly conv, threadlocal and checksum support.
+
+For encryption, the crypto lib part of openssl-1.x
 
 You can build and embed wdt as a library with as little as a C++11 compiler
 and glog - and you could macro away glog or replace it by printing to stderr if
@@ -90,8 +103,18 @@ needed.
 
 ### Directories
 
-* deps/
-Dependencies (open source version)
+* top level
+Main WDT classes and Wdt command line source, CMakeLists.txt
+
+* util/
+Utilities used for implementing the main objects
+
+* test/
+Tests files and scripts
+
+* build/
+Build related scripts and files and utils
+
 
 * fbonly/
 Stuff specific to facebook/ (not in open source version)
@@ -102,9 +125,9 @@ Benchmark generation tools
 
 ### Main files
 
-* CMakeLists.txt, BUILD.md, .travis.yml, travis_linux.sh, travis_osx.sh
+* CMakeLists.txt, .travis.yml, build/BUILD.md,travis_linux.sh,travis_osx.sh
 Build definition file - use CMake to generate a Makefile or a project file for
-your favorite IDE - details in [BUILD.md](BUILD.md)
+your favorite IDE - details in [build/BUILD.md](build/BUILD.md)
 
 * wdtCmdline.cpp
 
@@ -122,6 +145,10 @@ To specify the behavior of wdt. If wdt is used as a library, then the
 caller get the mutable object of options and set different options accordingly.
 When wdt is run in a standalone mode, behavior is changed through gflags in
 wdtCmdLine.cpp
+
+* WdtThread.{h|cpp}
+Common functionality and settings between SenderThread and ReceiverThread.
+Both of these kind of threads inherit from this base class.
 
 * WdtBase.{h|cpp}
 
@@ -154,11 +181,20 @@ directory, sorted by decreasing size (as they are discovered, you can start
 pulling from the queue even before all the files are found, it will return
 the current largest file)
 
+* ThreadTransferHistory.{h|cpp}
+
+Every thread maintains a transfer history so that when a connection breaks
+it can talk to the receiver to find out up to where in the history has been
+sent. This class encapsulates all the logic for that bookkeeping
+
+* SenderThread.{h|cpp}
+
+Implements the functionality of one sender thread, which binds to a certain port
+and sends files over.
 
 * Sender.{h|cpp}
 
-Formerly wdtlib.cpp - main code sending files
-
+Spawns multiple SenderThread threads and sends the data across to receiver
 
 ### Consuming / Receiving
 
@@ -166,10 +202,15 @@ Formerly wdtlib.cpp - main code sending files
 
 Creates file and directories necessary for said file (mkdir -p like)
 
+* ReceiverThread.{h|cpp}
+
+Implements the funcionality of the receiver threads, responsible for listening on
+a port and receiving files over the network.
+
 * Receiver.{h|cpp}
 
-Formerly wdtlib.cpp - main code receiving files
-
+Parent receiver class that spawns multiple ReceiverThread threads and receives
+data from a remote host
 
 ### Low level building blocks
 
@@ -268,15 +309,23 @@ wdt_max_send_test.sh
 (facebook only:)
 Make sure to do the following, before "arc diff":
 ```
- (cd wdt ; ./clangformat.sh )
+ (cd wdt ; ./build/clangformat.sh )
+ # if you changed the minor version of the protocol (in CMakeLists.txt)
+ # run (cd wdt ; ./build/version_update.tcl ) to sync with fbcode's WdtConfig.h
 
- fbconfig  --clang --with-project-version clang:dev -r  wdt
+ fbconfig  --clang --sanitize=address -r  wdt
 
- fbmake runtests
+ fbmake runtests --run-disabled --extended-tests
+ # Optionally: opt build
  fbmake runtests_opt
  fbmake opt
-
- wdt/wdt_max_send_test.sh
+ # Sender max speed test
+ wdt/test/wdt_max_send_test.sh
+ # Check buck build
+ buck build wdt/...
+ # Debug a specific test with full output even on success:
+ buck test wdt:xxx -- --run-disabled --extended-tests --print-passing-details\
+   --print-long-results
 ```
 
 and check the output of the last step to make sure one of the 3 runs is
